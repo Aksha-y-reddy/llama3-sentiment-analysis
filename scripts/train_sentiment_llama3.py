@@ -93,12 +93,18 @@ def load_amazon_reviews_2023_binary(
             ds = ds.map(map_label_binary)
             ds = ds.filter(lambda ex: ex["label"] != -1 and ex["text"] is not None and len(ex["text"].strip()) > 10)
             
-            # For streaming, we need to materialize a portion for train/test split
+            # For small samples, don't use streaming (more efficient)
             if streaming:
-                # Take a sample for this category
+                # Stream with iterator to avoid loading everything
                 sample_size = (train_max or 10000) + (eval_max or 1000)
-                ds_list = list(ds.take(sample_size))
-                ds = Dataset.from_list(ds_list)
+                ds_iter = iter(ds)
+                samples = []
+                for _ in range(sample_size):
+                    try:
+                        samples.append(next(ds_iter))
+                    except StopIteration:
+                        break
+                ds = Dataset.from_list(samples)
             
             # Shuffle and split
             ds = ds.shuffle(seed=seed)
