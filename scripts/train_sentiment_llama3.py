@@ -38,20 +38,17 @@ def load_amazon_reviews_2023_binary(
     streaming: bool = True,
 ) -> DatasetDict:
     """
-    Load Amazon Reviews 2023 dataset for binary sentiment analysis.
+    OPTIMIZED: Load Amazon Reviews 2023 using STREAMING mode.
+    
+    KEY IMPROVEMENTS:
+    1. STREAMING MODE - No disk download, memory efficient
+    2. SINGLE-PASS FILTERING - Filter during streaming, not after
+    3. EFFICIENT SAMPLING - Early exit once we have enough samples
+    
     Dataset: https://amazon-reviews-2023.github.io/
-    
     Rating mapping: 1-2 → negative (0), 4-5 → positive (1), drop 3's
-    
-    Args:
-        seed: Random seed
-        categories: List of categories to load (None = all 33 categories)
-        train_max: Max training samples per category
-        eval_max: Max eval samples per category
-        streaming: Use streaming mode for large datasets
     """
     if categories is None:
-        # Load all available categories for full dataset training
         categories = [
             "All_Beauty", "Amazon_Fashion", "Appliances", "Arts_Crafts_and_Sewing",
             "Automotive", "Baby_Products", "Beauty_and_Personal_Care", "Books",
@@ -65,22 +62,17 @@ def load_amazon_reviews_2023_binary(
             "Toys_and_Games", "Video_Games"
         ]
     
-    print(f"Loading Amazon Reviews 2023 from {len(categories)} categories...")
+    print(f"\n{'='*70}")
+    print(f"Loading Amazon Reviews 2023 - STREAMING MODE")
+    print(f"Categories: {len(categories)}, Train max: {train_max}, Eval max: {eval_max}")
+    print(f"{'='*70}\n")
     
-    def map_label_binary(ex):
-        """Map rating to binary sentiment: 1-2→0 (neg), 4-5→1 (pos), 3→drop"""
-        rating = ex.get("rating", 3.0)
-        if rating == 3.0:
-            return {"label": -1, "text": ex.get("text", "")}
-        label = 1 if rating >= 4.0 else 0
-        return {"label": label, "text": ex.get("text", "")}
+    all_train_samples = []
+    all_eval_samples = []
     
-    all_train_datasets = []
-    all_eval_datasets = []
-    
-    for category in tqdm(categories, desc="Loading categories"):
+    for category in tqdm(categories, desc="Streaming categories"):
         try:
-            # Load from HuggingFace datasets
+            # STREAMING MODE - no disk download!
             ds = load_dataset(
                 "McAuley-Lab/Amazon-Reviews-2023",
                 f"raw_review_{category}",
@@ -89,63 +81,68 @@ def load_amazon_reviews_2023_binary(
                 trust_remote_code=True
             )
             
-            # Map labels and filter
-            ds = ds.map(map_label_binary)
-            ds = ds.filter(lambda ex: ex["label"] != -1 and ex["text"] is not None and len(ex["text"].strip()) > 10)
+            # Calculate samples needed with buffer for filtering
+            target_samples = (train_max or 10000) + (eval_max or 1000)
+            samples_to_fetch = int(target_samples * 1.2)  # 20% buffer
             
-            # For small samples, don't use streaming (more efficient)
-            if streaming:
-                # Stream with iterator to avoid loading everything
-                sample_size = (train_max or 10000) + (eval_max or 1000)
-                ds_iter = iter(ds)
-                samples = []
-                for _ in range(sample_size):
-                    try:
-                        samples.append(next(ds_iter))
-                    except StopIteration:
-                        break
-                ds = Dataset.from_list(samples)
+            # Stream and filter in one pass
+            category_samples = []
+            pos_count, neg_count = 0, 0
+            
+            for ex in ds:
+                if len(category_samples) >= samples_to_fetch:
+                    break
+                
+                rating = ex.get("rating", 3.0)
+                text = ex.get("text", "") or ""
+                
+                # Skip 3-star and invalid reviews immediately
+                if rating == 3.0 or len(text.strip()) <= 10:
+                    continue
+                
+                label = 1 if rating >= 4.0 else 0
+                category_samples.append({"text": text, "label": label})
+                
+                if label == 1:
+                    pos_count += 1
+                else:
+                    neg_count += 1
             
             # Shuffle and split
-            ds = ds.shuffle(seed=seed)
-            split = ds.train_test_split(test_size=0.05, seed=seed)
-            train_ds, eval_ds = split["train"], split["test"]
+            random.shuffle(category_samples)
+            eval_size = min(eval_max or 1000, len(category_samples) // 20)
+            train_size = min(train_max or 10000, len(category_samples) - eval_size)
             
-            # Limit sizes
-            if train_max and len(train_ds) > train_max:
-                train_ds = train_ds.select(range(train_max))
-            if eval_max and len(eval_ds) > eval_max:
-                eval_ds = eval_ds.select(range(eval_max))
+            all_train_samples.extend(category_samples[:train_size])
+            all_eval_samples.extend(category_samples[train_size:train_size + eval_size])
             
-            all_train_datasets.append(train_ds)
-            all_eval_datasets.append(eval_ds)
-            
-            print(f"  {category}: {len(train_ds):,} train, {len(eval_ds):,} eval")
+            print(f"  ✓ {category:35s}: {train_size:>6,} train, {eval_size:>5,} eval | Pos: {pos_count}, Neg: {neg_count}")
             
         except Exception as e:
-            print(f"  Warning: Could not load {category}: {e}")
+            print(f"  ✗ {category:35s}: Error - {str(e)[:50]}")
             continue
     
-    # Concatenate all categories
-    if not all_train_datasets:
-        raise ValueError("No datasets loaded successfully!")
+    if not all_train_samples:
+        raise ValueError("No samples loaded! Check internet connection.")
     
-    combined_train = concatenate_datasets(all_train_datasets)
-    combined_eval = concatenate_datasets(all_eval_datasets)
-    
-    # Keep only text and label columns
-    keep_cols = ["text", "label"]
-    drop_cols = [c for c in combined_train.column_names if c not in keep_cols]
-    if drop_cols:
-        combined_train = combined_train.remove_columns(drop_cols)
-        combined_eval = combined_eval.remove_columns(drop_cols)
+    # Convert to Dataset objects
+    train_ds = Dataset.from_list(all_train_samples)
+    eval_ds = Dataset.from_list(all_eval_samples)
     
     # Final shuffle
-    combined_train = combined_train.shuffle(seed=seed)
-    combined_eval = combined_eval.shuffle(seed=seed)
+    train_ds = train_ds.shuffle(seed=seed)
+    eval_ds = eval_ds.shuffle(seed=seed)
     
-    print(f"\nTotal: {len(combined_train):,} train, {len(combined_eval):,} eval samples")
-    return DatasetDict({"train": combined_train, "eval": combined_eval})
+    # Report class distribution
+    train_pos = sum(1 for s in all_train_samples if s["label"] == 1)
+    train_neg = len(all_train_samples) - train_pos
+    
+    print(f"\n{'='*70}")
+    print(f"DATASET LOADED: {len(train_ds):,} train, {len(eval_ds):,} eval")
+    print(f"Class balance: {train_pos/len(train_ds)*100:.1f}% pos, {train_neg/len(train_ds)*100:.1f}% neg")
+    print(f"{'='*70}\n")
+    
+    return DatasetDict({"train": train_ds, "eval": eval_ds})
 
 
 def load_amazon_us_reviews_binary(
@@ -450,7 +447,7 @@ def main():
 
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
     # Determine categories to load
     categories = None
     if args.use_amazon_2023 and args.categories and args.categories != "all":
@@ -582,13 +579,13 @@ def main():
     print(f"Eval samples: {len(eval_ds):,}")
     print(f"Effective batch size: {args.per_device_train_bs * args.grad_accum_steps}")
     print(f"Total epochs: {args.epochs}")
-    
+
     trainer.train()
     
     print("\nSaving model and tokenizer...")
     trainer.model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    
+
     # ============================================================
     # POST-TRAINING EVALUATION
     # ============================================================
