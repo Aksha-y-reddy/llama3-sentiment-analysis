@@ -30,93 +30,98 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+from huggingface_hub import hf_hub_download
+
 def load_amazon_reviews_2023_binary(
     seed: int,
     categories: List[str] | None = None,
     train_max: int | None = None,
     eval_max: int | None = None,
-    streaming: bool = True,
+    streaming: bool = True,  # Ignored, kept for backward compatibility
 ) -> DatasetDict:
     """
-    OPTIMIZED: Load Amazon Reviews 2023 using STREAMING mode.
+    OPTIMIZED: Load Amazon Reviews 2023 from JSONL files.
     
     KEY IMPROVEMENTS:
-    1. STREAMING MODE - No disk download, memory efficient
-    2. SINGLE-PASS FILTERING - Filter during streaming, not after
-    3. EFFICIENT SAMPLING - Early exit once we have enough samples
+    1. DIRECT JSONL LOADING - No deprecated trust_remote_code
+    2. FILE CACHING - Downloaded files are cached for fast reloading
+    3. SINGLE-PASS FILTERING - Filter during read, not after
+    4. EFFICIENT SAMPLING - Early exit once we have enough samples
     
     Dataset: https://amazon-reviews-2023.github.io/
     Rating mapping: 1-2 → negative (0), 4-5 → positive (1), drop 3's
     """
+    # Recommended categories based on data analysis (high negative %, large datasets)
+    DEFAULT_CATEGORIES = [
+        "Cell_Phones_and_Accessories",  # 14.1% negative, 9.3 GB
+        "Electronics",                   # 11.0% negative, 22.6 GB
+        "Pet_Supplies"                   # 11.6% negative, 8.3 GB
+    ]
+    
     if categories is None:
-        categories = [
-            "All_Beauty", "Amazon_Fashion", "Appliances", "Arts_Crafts_and_Sewing",
-            "Automotive", "Baby_Products", "Beauty_and_Personal_Care", "Books",
-            "CDs_and_Vinyl", "Cell_Phones_and_Accessories", "Clothing_Shoes_and_Jewelry",
-            "Digital_Music", "Electronics", "Gift_Cards", "Grocery_and_Gourmet_Food",
-            "Handmade_Products", "Health_and_Household", "Health_and_Personal_Care",
-            "Home_and_Kitchen", "Industrial_and_Scientific", "Kindle_Store",
-            "Magazine_Subscriptions", "Movies_and_TV", "Musical_Instruments",
-            "Office_Products", "Patio_Lawn_and_Garden", "Pet_Supplies", "Software",
-            "Sports_and_Outdoors", "Subscription_Boxes", "Tools_and_Home_Improvement",
-            "Toys_and_Games", "Video_Games"
-        ]
+        categories = DEFAULT_CATEGORIES
     
     print(f"\n{'='*70}")
-    print(f"Loading Amazon Reviews 2023 - STREAMING MODE")
-    print(f"Categories: {len(categories)}, Train max: {train_max}, Eval max: {eval_max}")
-    print(f"{'='*70}\n")
+    print(f"Loading Amazon Reviews 2023 from JSONL files")
+    print(f"Categories: {categories}")
+    print(f"Train max: {train_max}, Eval max: {eval_max}")
+    print(f"{'='*70}")
+    print("⏳ First run downloads files (cached afterwards)...\n")
     
     all_train_samples = []
     all_eval_samples = []
     
-    for category in tqdm(categories, desc="Streaming categories"):
+    for category in tqdm(categories, desc="Loading categories"):
         try:
-            # STREAMING MODE - no disk download!
-            ds = load_dataset(
-                "McAuley-Lab/Amazon-Reviews-2023",
-                f"raw_review_{category}",
-                split="full",
-                streaming=streaming,
-                trust_remote_code=True
+            # Download JSONL file (cached after first download)
+            file_path = hf_hub_download(
+                repo_id="McAuley-Lab/Amazon-Reviews-2023",
+                filename=f"raw/review_categories/{category}.jsonl",
+                repo_type="dataset"
             )
             
             # Calculate samples needed with buffer for filtering
             target_samples = (train_max or 10000) + (eval_max or 1000)
-            samples_to_fetch = int(target_samples * 1.2)  # 20% buffer
+            samples_to_fetch = int(target_samples * 1.3)  # 30% buffer
             
-            # Stream and filter in one pass
+            # Read JSONL line by line
             category_samples = []
             pos_count, neg_count = 0, 0
             
-            for ex in ds:
-                if len(category_samples) >= samples_to_fetch:
-                    break
-                
-                rating = ex.get("rating", 3.0)
-                text = ex.get("text", "") or ""
-                
-                # Skip 3-star and invalid reviews immediately
-                if rating == 3.0 or len(text.strip()) <= 10:
-                    continue
-                
-                label = 1 if rating >= 4.0 else 0
-                category_samples.append({"text": text, "label": label})
-                
-                if label == 1:
-                    pos_count += 1
-                else:
-                    neg_count += 1
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if len(category_samples) >= samples_to_fetch:
+                        break
+                    
+                    try:
+                        ex = json.loads(line)
+                        rating = float(ex.get("rating", 3.0))
+                        text = ex.get("text", "") or ""
+                        
+                        # Skip 3-star and invalid reviews immediately
+                        if rating == 3.0 or len(text.strip()) <= 10:
+                            continue
+                        
+                        label = 1 if rating >= 4.0 else 0
+                        category_samples.append({"text": text, "label": label})
+                        
+                        if label == 1:
+                            pos_count += 1
+                        else:
+                            neg_count += 1
+                    except:
+                        continue
             
             # Shuffle and split
             random.shuffle(category_samples)
-            eval_size = min(eval_max or 1000, len(category_samples) // 20)
+            eval_size = min(eval_max or 1000, len(category_samples) // 10)
             train_size = min(train_max or 10000, len(category_samples) - eval_size)
             
             all_train_samples.extend(category_samples[:train_size])
             all_eval_samples.extend(category_samples[train_size:train_size + eval_size])
             
-            print(f"  ✓ {category:35s}: {train_size:>6,} train, {eval_size:>5,} eval | Pos: {pos_count}, Neg: {neg_count}")
+            neg_pct = neg_count / (pos_count + neg_count) * 100 if (pos_count + neg_count) > 0 else 0
+            print(f"  ✓ {category:35s}: {train_size:>6,} train, {eval_size:>5,} eval | Neg: {neg_pct:.1f}%")
             
         except Exception as e:
             print(f"  ✗ {category:35s}: Error - {str(e)[:50]}")
@@ -138,7 +143,7 @@ def load_amazon_reviews_2023_binary(
     train_neg = len(all_train_samples) - train_pos
     
     print(f"\n{'='*70}")
-    print(f"DATASET LOADED: {len(train_ds):,} train, {len(eval_ds):,} eval")
+    print(f"✅ DATASET LOADED: {len(train_ds):,} train, {len(eval_ds):,} eval")
     print(f"Class balance: {train_pos/len(train_ds)*100:.1f}% pos, {train_neg/len(train_ds)*100:.1f}% neg")
     print(f"{'='*70}\n")
     
