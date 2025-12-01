@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data
+data/
+*.jsonl
+*.json
+*.csv
+*.parquet
+
+# Models & Checkpoints
+models/
+checkpoints/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Logs
+*.log
+logs/
+wandb/
+*.jsonl
+
+# Environment
+.env
+.venv
+*.token
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Research artifacts (keep local only)
+**/brain/
+**/.gemini/
+RESEARCH_DOCUMENTATION.md
+pipeline_issues_analysis.md
+training_enhancements.md
