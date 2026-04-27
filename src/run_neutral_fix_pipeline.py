@@ -14,10 +14,12 @@ Typical Colab usage:
       --train
 
 Required before running:
-    1. Create ``data/raw_150k.parquet`` with columns:
-       review_id, category, rating, title, text, label
-    2. Set API key if running judge stages:
+    1. Set API key if running judge stages:
        import os; os.environ["TOGETHER_API_KEY"] = "..."
+
+If ``data/raw_150k.parquet`` is missing, the runner can now create it using
+the same McAuley Amazon Reviews 2023 loading strategy used in the baseline
+notebook: balanced 50K/class train samples plus 5K/class eval samples.
 
 Manual labeling is the only unavoidable human step. The runner creates
 ``results/manual_labels_750.csv`` and pauses until it is complete unless
@@ -38,6 +40,7 @@ import pandas as pd
 
 
 DEFAULTS = {
+    "tracking": "data/llama3-data-tracking-Cell_Phones_and_Accessories-3class.json",
     "cleanlab": "results/cleanlab_audit.json",
     "manual": "results/manual_labels_750.csv",
     "noise": "results/true_noise_rate.json",
@@ -121,15 +124,44 @@ def maybe_install_requirements(args: argparse.Namespace) -> None:
         run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"], args.dry_run)
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
+def ensure_raw_dataset(args: argparse.Namespace) -> None:
     raw_dataset = Path(args.raw_dataset)
-    require(
-        raw_dataset,
-        "Create it first from the baseline notebook/data loader. Required columns: "
-        "review_id, category, rating, title, text, label.",
+    if raw_dataset.exists() and not args.force_raw_export:
+        print(f"Using existing raw dataset: {raw_dataset}")
+        return
+
+    print(f"Raw dataset missing or forced. Exporting baseline-style data to {raw_dataset}")
+    run(
+        [
+            sys.executable,
+            "src/data/export_raw_150k.py",
+            "--output",
+            args.raw_dataset,
+            "--category",
+            args.category,
+            "--num-classes",
+            "3",
+            "--train-per-class",
+            str(args.train_per_class),
+            "--eval-per-class",
+            str(args.eval_per_class),
+            "--training-phase",
+            args.training_phase,
+            "--tracking-file",
+            args.tracking_file,
+            "--seed",
+            str(args.seed),
+        ],
+        args.dry_run,
     )
 
+
+def run_pipeline(args: argparse.Namespace) -> None:
     maybe_install_requirements(args)
+    ensure_raw_dataset(args)
+
+    raw_dataset = Path(args.raw_dataset)
+    require(raw_dataset, "Raw dataset export failed.")
 
     if not exists(args.cleanlab_output) or args.force:
         run(
@@ -304,6 +336,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dataset", default="data/raw_150k.parquet")
+    parser.add_argument("--category", default="Cell_Phones_and_Accessories")
+    parser.add_argument("--training-phase", choices=["baseline", "sequential"], default="baseline")
+    parser.add_argument("--train-per-class", type=int, default=50_000)
+    parser.add_argument("--eval-per-class", type=int, default=5_000)
+    parser.add_argument("--tracking-file", default=DEFAULTS["tracking"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cleanlab-output", default=DEFAULTS["cleanlab"])
     parser.add_argument("--manual-labels", default=DEFAULTS["manual"])
     parser.add_argument("--noise-output", default=DEFAULTS["noise"])
@@ -323,6 +361,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-limit", type=int, default=0, help="Debug only")
     parser.add_argument("--skip-judge", action="store_true")
     parser.add_argument("--install", action="store_true", help="pip install -r requirements.txt first")
+    parser.add_argument("--force-raw-export", action="store_true")
     parser.add_argument("--force", action="store_true", help="rerun stages even when outputs exist")
     parser.add_argument("--no-pause", action="store_true", help="fail instead of waiting for manual labels")
     parser.add_argument("--dry-run", action="store_true")
